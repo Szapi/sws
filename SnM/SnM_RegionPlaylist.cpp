@@ -1367,6 +1367,36 @@ bool SeekItem(int _plId, int _nextItemId, int _curItemId)
 	return false;
 }
 
+void UpdateDisplayWindows()
+{
+	// one call to GetMonitoringInfo() for both the wnd & osc
+	WDL_FastString cur, curNum, next, nextNum;
+	GetMonitoringInfo(&curNum, &cur, &nextNum, &next);
+
+	if (RegionPlaylistWnd* w = g_rgnplWndMgr.Get())
+		w->Update(1, &curNum, &cur, &nextNum, &next); // 1: fast update flag
+
+	if (g_osc)
+	{
+		static WDL_FastString sOSC_CURRENT_RGN(OSC_CURRENT_RGN);
+		static WDL_FastString sOSC_NEXT_RGN(OSC_NEXT_RGN);
+
+		if (curNum.GetLength() && cur.GetLength()) curNum.Append(" ");
+		curNum.Append(&cur);
+
+		if (nextNum.GetLength() && next.GetLength()) nextNum.Append(" ");
+		nextNum.Append(&next);
+
+		WDL_PtrList<WDL_FastString> strs;
+		strs.Add(&sOSC_CURRENT_RGN);
+		strs.Add(&curNum);
+		strs.Add(&sOSC_NEXT_RGN);
+		strs.Add(&nextNum);
+		g_osc->SendStrBundle(&strs);
+		strs.Empty(false);
+	}
+}
+
 // the meat!
 // polls the playing position and smooth seeks if needed
 // remember we always lookup one region ahead!
@@ -1488,32 +1518,7 @@ void PlaylistRun()
 		g_lastRunPos = pos;
 		if (updated && (g_osc || g_rgnplWndMgr.Get()))
 		{
-			// one call to GetMonitoringInfo() for both the wnd & osc
-			WDL_FastString cur, curNum, next, nextNum;
-			GetMonitoringInfo(&curNum, &cur, &nextNum, &next);
-
-			if (RegionPlaylistWnd* w = g_rgnplWndMgr.Get())
-				w->Update(1, &curNum, &cur, &nextNum, &next); // 1: fast update flag
-
-			if (g_osc)
-			{
-				static WDL_FastString sOSC_CURRENT_RGN(OSC_CURRENT_RGN);
-				static WDL_FastString sOSC_NEXT_RGN(OSC_NEXT_RGN);
-
-				if (curNum.GetLength() && cur.GetLength()) curNum.Append(" ");
-				curNum.Append(&cur);
-
-				if (nextNum.GetLength() && next.GetLength()) nextNum.Append(" ");
-				nextNum.Append(&next);
-
-				WDL_PtrList<WDL_FastString> strs;
-				strs.Add(&sOSC_CURRENT_RGN);
-				strs.Add(&curNum);
-				strs.Add(&sOSC_NEXT_RGN);
-				strs.Add(&nextNum);
-				g_osc->SendStrBundle(&strs);
-				strs.Empty(false);
-			}
+			UpdateDisplayWindows();
 		}
 	}
 }
