@@ -126,6 +126,7 @@ double g_curRgnPos = 0.0, g_curRgnEnd = -1.0; // to detect unsync, end<pos means
 int g_oldSeekPref = -1;
 int g_oldStopprojlenPref = -1;
 int g_oldRepeatState = -1;
+int g_oldStopEndOfLoop = -1;
 
 
 // _plId: -1 for the displayed/edited playlist
@@ -238,6 +239,15 @@ struct ReaperInterface {
 	bool IsPlaybackPaused() {
 		return static_cast<bool>(GetPlayStateEx(nullptr)&2);
 	}
+
+	void StopAtEndOfRegion(int rgnNum) {
+		if (ConfigVar<int> opt = "stopendofloop") {
+			*opt = 1;
+		}
+		TimeInterval bounds = GetRegionBounds(rgnNum);
+		GetSet_LoopTimeRange2(nullptr, true, false, &bounds.begin, &bounds.end, false);
+		SetEditCurPos2(nullptr, bounds.end, false, false);
+	}
 };
 
 
@@ -345,6 +355,10 @@ class RegionSwitcher {
 		nextRegionDetector.SetRegions(curRegion.bounds, nextRegion.bounds);
 
 		reaper.SeekPlay(curRegion.bounds.begin);
+
+		if (!nextRegion.Valid()) {
+			reaper.StopAtEndOfRegion(curRegion.idx);
+		}
 	}
 
 public:
@@ -370,6 +384,8 @@ public:
 			nextRegionScheduled = false;
 			if (nextRegion.Valid()) {
 				nextRegionDetector.SetRegions(curRegion.bounds, nextRegion.bounds);
+			} else {
+				reaper.StopAtEndOfRegion(curRegion.idx);
 			}
             return true;
 		} else if (!IsInside(pos, curRegion.bounds)) {
@@ -437,6 +453,8 @@ bool IsMonitorMode()
 }
 
 /////////////////
+
+TimeInterval g_oldTimeSelection = InvalidInterval;
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1732,6 +1750,8 @@ void PlaylistPlay(int _plId, int _itemId)
 			if (g_seekImmediate)
 				PlaylistStop();
 
+			// save time selection
+			GetSet_LoopTimeRange2(nullptr, false, false, &g_oldTimeSelection.begin, &g_oldTimeSelection.end, false);
 			// temp override of the "smooth seek" option
 			if (ConfigVar<int> opt = "smoothseek") {
 				g_oldSeekPref = *opt;
@@ -1741,6 +1761,11 @@ void PlaylistPlay(int _plId, int _itemId)
 			if (GetSetRepeat(-1) == 1) {
 				g_oldRepeatState = 1;
 				GetSetRepeat(0);
+			}
+			// temp override of the "Stop playback at end of loop..." option
+			if (ConfigVar<int> opt = "stopendofloop") {
+				g_oldStopEndOfLoop = *opt;
+				*opt = 0;
 			}
 
 			g_playlistExecutor.emplace(_plId, _itemId, g_listener);    
@@ -1823,6 +1848,9 @@ void PlaylistStopped()
 {
 	if (g_playlistExecutor.has_value())
 	{
+		// restore time selection
+		GetSet_LoopTimeRange2(nullptr, true, false, &g_oldTimeSelection.begin, &g_oldTimeSelection.end, false);
+		g_oldTimeSelection = InvalidInterval;
 		// restore options
 		if (g_oldSeekPref >= 0)
 			if (ConfigVar<int> opt = "smoothseek") {
@@ -1838,6 +1866,11 @@ void PlaylistStopped()
 			GetSetRepeat(g_oldRepeatState);
 			g_oldRepeatState = -1;
 		}
+		if (g_oldStopEndOfLoop >= 0)
+			if (ConfigVar<int> opt = "stopendofloop") {
+				*opt = g_oldStopEndOfLoop;
+				g_oldStopEndOfLoop = -1;
+			}
 
         g_playlistExecutor.clear();
 	}
