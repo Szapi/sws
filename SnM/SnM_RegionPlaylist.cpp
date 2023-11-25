@@ -107,7 +107,6 @@ SNM_OscCSurf* g_osc = NULL;
 
 // user prefs
 char g_rgnplBigFontName[64] = SNM_DYN_FONT_NAME;
-bool g_monitorMode = false;
 bool g_repeatPlaylist = false;	// playlist repeat state
 bool g_seekImmediate = false;
 bool g_shufflePlaylist = false;  // Playlist shuffle state.
@@ -431,6 +430,11 @@ public:
 
 
 TRM::Optional<PlaylistExecutor> g_playlistExecutor;
+
+bool IsMonitorMode()
+{
+    return g_playlistExecutor.has_value();
+}
 
 /////////////////
 
@@ -917,7 +921,7 @@ void RegionPlaylistWnd::Update(int _flags, WDL_FastString* _curNum, WDL_FastStri
 		return;
 	sRecurseCheck = true;
 
-	ShowWindow(GetDlgItem(m_hwnd, IDC_LIST), !g_monitorMode && g_pls.Get()->GetSize() ? SW_SHOW : SW_HIDE);
+	ShowWindow(GetDlgItem(m_hwnd, IDC_LIST), !IsMonitorMode() && g_pls.Get()->GetSize() ? SW_SHOW : SW_HIDE);
 
 	// normal/full update
 	if (!_flags)
@@ -932,7 +936,7 @@ void RegionPlaylistWnd::Update(int _flags, WDL_FastString* _curNum, WDL_FastStri
 	else if (_flags&1)
 	{
 		// monitoring mode
-		if (g_monitorMode)
+		if (IsMonitorMode())
 			UpdateMonitoring(_curNum, _cur, _nextNum, _next);
 		// edition mode
 		else if (g_pls.Get()->m_editId == g_playPlaylist && m_pLists.GetSize()) // is it the displayed playlist?
@@ -1263,7 +1267,7 @@ void RegionPlaylistWnd::DrawControls(LICE_IBitmap* _bm, const RECT* _r, int* _to
 #endif
 			{
 				// *** monitoring ***
-				if (g_monitorMode)
+				if (IsMonitorMode())
 				{
 					RECT r = *_r;
 
@@ -1334,7 +1338,7 @@ void RegionPlaylistWnd::DrawControls(LICE_IBitmap* _bm, const RECT* _r, int* _to
 			SNM_AutoVWndPosition(DT_RIGHT, &m_btnPlay, NULL, _r, &x0, _r->top, h, 0);
 		}
 	}
-	if (g_monitorMode)
+	if (IsMonitorMode())
 		SNM_AddLogo(_bm, _r);
 #endif
 }
@@ -1381,7 +1385,7 @@ void RegionPlaylistWnd::OptionsMenu(HMENU _menu)
 HMENU RegionPlaylistWnd::OnContextMenu(int _x, int _y, bool* _wantDefaultItems)
 {
 	HMENU hMenu = CreatePopupMenu();
-	if (!g_monitorMode)
+	if (!IsMonitorMode())
 	{
 		// specific context menu for the paste button
 		POINT p; GetCursorPos(&p);
@@ -1502,13 +1506,6 @@ bool RegionPlaylistWnd::GetToolTipString(int _xpos, int _ypos, char* _bufOut, in
 		}
 	}
 	return false;
-}
-
-void SetLock(bool lock)
-{
-	g_monitorMode = lock;
-	if (RegionPlaylistWnd* w = g_rgnplWndMgr.Get())
-		w->Update();
 }
 
 
@@ -1690,7 +1687,7 @@ void UpdateDisplayWindows()
 // made as idle as possible, polled via SNM_CSurfRun()
 void PlaylistRun()
 {
-	if (!g_playlistExecutor.empty()) {
+	if (g_playlistExecutor.has_value()) {
 		g_playlistExecutor->Run();
 	}
 }
@@ -1746,8 +1743,9 @@ void PlaylistPlay(int _plId, int _itemId)
 				GetSetRepeat(0);
 			}
 
-			g_playlistExecutor.emplace(_plId, _itemId, g_listener);
-			SetLock(true);
+			g_playlistExecutor.emplace(_plId, _itemId, g_listener);    
+            if (RegionPlaylistWnd* w = g_rgnplWndMgr.Get())
+                w->Update();
 		}
 	}
 }
@@ -1812,7 +1810,7 @@ void PlaylistSeekPrevNextCurBased(COMMAND_T* _ct)
 
 void PlaylistStop()
 {
-	if (!g_playlistExecutor.empty() || (GetPlayStateEx(NULL)&1) == 1)
+	if (g_playlistExecutor.has_value() || (GetPlayStateEx(NULL)&1) == 1)
 	{
 		OnStopButton();
 /* commented: already done via SNM_CSurfSetPlayState() callback
@@ -1823,7 +1821,7 @@ void PlaylistStop()
 
 void PlaylistStopped()
 {
-	if (!g_playlistExecutor.empty())
+	if (g_playlistExecutor.has_value())
 	{
 		// restore options
 		if (g_oldSeekPref >= 0)
@@ -1844,7 +1842,8 @@ void PlaylistStopped()
         g_playlistExecutor.clear();
 	}
 
-	SetLock(false);
+	if (RegionPlaylistWnd* w = g_rgnplWndMgr.Get())
+		w->Update();
 }
 
 void PlaylistUnpaused() {
@@ -2367,7 +2366,7 @@ void ToggleRegionPlaylistLock(COMMAND_T*) {
 }
 
 int IsRegionPlaylistMonitoring(COMMAND_T*) {
-	return g_monitorMode;
+	return IsMonitorMode();
 }
 
 void AddAllRegionsToPlaylist(COMMAND_T *ct)

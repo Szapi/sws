@@ -42,7 +42,7 @@ public:
     Optional() = default;
     ~Optional() { clear(); }
 
-    bool empty() const { return !hasValue; }
+    bool has_value() const { return hasValue; }
 
     template<class... Args>
     void emplace(Args&&... args) {
@@ -52,7 +52,7 @@ public:
     }
 
     void clear() {
-        if (!empty())
+        if (has_value())
             (*this)->~Type();
         hasValue = false;
     }
