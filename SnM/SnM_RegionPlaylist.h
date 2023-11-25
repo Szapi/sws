@@ -98,7 +98,6 @@ public:
 	void Update(int _flags = 0, WDL_FastString* _curNum=NULL, WDL_FastString* _cur=NULL, WDL_FastString* _nextNum=NULL, WDL_FastString* _next=NULL);
 	void UpdateMonitoring(WDL_FastString* _curNum=NULL, WDL_FastString* _cur=NULL, WDL_FastString* _nextNum=NULL, WDL_FastString* _next=NULL);
 	void FillPlaylistCombo();
-	void ToggleLock();
 protected:
 	void OnInitDlg();
 	void OnDestroy();
@@ -118,7 +117,7 @@ protected:
 	SNM_TinyPlusButton m_btnAdd;
 	SNM_TinyMinusButton m_btnDel;
 	SNM_ToolbarButton m_btnCrop;
-	WDL_VirtualIconButton m_btnLock, m_btnPlay, m_btnStop, m_btnRepeat;
+	WDL_VirtualIconButton m_btnPlay, m_btnStop, m_btnRepeat;
 	SNM_DynSizedText m_monPl;
 	SNM_FiveMonitors m_mons;
 	SNM_DynSizedText m_txtMon[5];
@@ -140,7 +139,7 @@ void PlaylistPlay(COMMAND_T*);
 void PlaylistSeekPrevNext(COMMAND_T*);
 void PlaylistSeekPrevNextCurBased(COMMAND_T*);
 void PlaylistStop();
-void PlaylistStopped(bool _pause = false);
+void PlaylistStopped();
 void PlaylistUnpaused();
 void PlaylistResync();
 void SetPlaylistRepeat(COMMAND_T*);

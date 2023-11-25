@@ -41,6 +41,10 @@
 #include <WDL/localize/localize.h>
 #include <WDL/projectcontext.h>
 
+#include "TRM/TRM_Optional.h"
+#include "TRM/TRM_Utility.h"
+
+
 #define RGNPL_WND_ID			"SnMRgnPlaylist"
 #define UNDO_PLAYLIST_STR		__LOCALIZE("Region Playlist edition", "sws_undo")
 
@@ -77,8 +81,7 @@ enum {
 };
 
 enum {
-	BTNID_LOCK = LAST_MSG,
-	BTNID_PLAY,
+	BTNID_PLAY = LAST_MSG,
 	BTNID_STOP,
 	BTNID_REPEAT,
 	TXTID_PLAYLIST,
@@ -131,6 +134,305 @@ RegionPlaylist* GetPlaylist(int _plId = -1) {
 	if (_plId < 0) _plId = g_pls.Get()->m_editId;
 	return g_pls.Get()->Get(_plId);
 }
+
+/////////////////
+
+struct TimeInterval {
+	double begin, end;
+
+	bool Valid() const {
+		return begin < end;
+	}
+};
+
+struct RegionData {
+	int idx;
+	TimeInterval bounds;
+
+	bool Valid() const { return 0 <= idx && bounds.Valid(); }
+};
+
+static const TimeInterval 	InvalidInterval   = {0.0, -1.0};
+static const RegionData 	InvalidRegionData = {-1, InvalidInterval};
+
+
+constexpr double TimeEps = 0.01;	// 10 ms
+
+bool Less(const double a, const double b) {
+	return a < (b + TimeEps);
+}
+
+bool Greater(const double a, const double b) {
+	return a > (b - TimeEps);
+}
+
+bool AreDistinct(const TimeInterval& a, const TimeInterval& b) {
+	return Less(a.end, b.begin) || Less(b.end, a.begin);
+}
+
+bool AreOverlapping(const TimeInterval& a, const TimeInterval& b) {
+	return !AreDistinct(a, b);
+}
+
+bool IsInside(const double p, const TimeInterval& i) {
+	return Greater(p, i.begin) && Less(p, i.end);
+}
+
+
+class RegionSource {
+	const int playlistId;
+
+	int nextPlaylistItemId;
+	int currRegionLoop = 0;
+	int currRegion     = -1;
+
+public:
+    RegionSource(const int _playlistId, const int _startItemId) :
+        playlistId{_playlistId},
+        nextPlaylistItemId{GetNextValidItem(_playlistId, _startItemId, true, g_repeatPlaylist, g_shufflePlaylist)}
+    {}
+
+	int GetNextRegion() {
+		if (currRegionLoop != 0) {
+			if (currRegionLoop > 0)
+				--currRegionLoop;
+
+			return currRegion;
+		}
+
+		if (nextPlaylistItemId < 0)
+			return -1;
+
+		RgnPlaylistItem& currItem = *(GetPlaylist(playlistId)->Get(nextPlaylistItemId));
+
+		currRegionLoop     = TRM::max(currItem.m_cnt-1, -1);
+		currRegion         = GetMarkerRegionNumFromId(currItem.m_rgnId);
+		nextPlaylistItemId = GetNextValidItem(playlistId, nextPlaylistItemId, false, g_repeatPlaylist, g_shufflePlaylist);
+
+		return currRegion;
+	}
+
+	int GetCurrRegionLoop() const {
+		return currRegionLoop;
+	}
+};
+
+struct ReaperInterface {
+    double GetPlayPosition() {
+        return GetPlayPositionEx(nullptr);
+    }
+
+	void ScheduleRegion(int rgnIdx) {
+		GoToRegion(nullptr, rgnIdx, false);
+	}
+
+	void SeekPlay(double time) {
+		::SeekPlay(time);
+	}
+
+	TimeInterval GetRegionBounds(int rgnIdx) {
+		TimeInterval bounds = InvalidInterval;
+		EnumMarkerRegionById(nullptr, MakeMarkerRegionId(rgnIdx, true), nullptr, &bounds.begin, &bounds.end, nullptr, nullptr, nullptr);
+		return bounds;
+	}
+
+	bool IsPlaybackPaused() {
+		return static_cast<bool>(GetPlayStateEx(nullptr)&2);
+	}
+};
+
+
+constexpr double JustInTimeNextRegionSchedulingWindow = 0.5;
+constexpr double ComplexDetectionThreshold            = 0.5;
+
+// Ford monitoring view update
+int g_currRegionNum  = -1;
+int g_currRegionLoop = 0;
+int g_nextRegionNum  = -1;
+
+void UpdateDisplayWindows();
+
+class PlayStateListener {
+public:
+    void OnStateChange(const int curr, const int currRegionLoop, const int next) {
+		g_currRegionNum  = curr;
+        g_currRegionLoop = currRegionLoop;
+		g_nextRegionNum  = next;
+		UpdateDisplayWindows();
+	}
+};
+
+PlayStateListener g_listener;
+
+class RegionSwitcher {
+	class RegionDetector {
+		enum DetectionMethod {
+			Simple,
+			Complex
+		};
+
+		enum ComplexDetectionPhase {
+			WaitingForFirst,
+			WaitingForSecond
+		};
+
+		DetectionMethod method;
+		ComplexDetectionPhase phase;
+
+		TimeInterval first;
+		TimeInterval second;		
+
+	public:
+		RegionDetector() {}
+
+		void SetRegions(const TimeInterval& currentRegion, const TimeInterval& nextRegion) {
+			if (AreDistinct(currentRegion, nextRegion) ||
+				Greater(currentRegion.begin - nextRegion.begin, ComplexDetectionThreshold) ||
+				Less(currentRegion.end - nextRegion.begin, ComplexDetectionThreshold))
+			{
+				method = Simple;
+				first = currentRegion;
+				second = nextRegion;
+			} else {
+				method = Complex;
+				phase = WaitingForFirst;
+				first = {(nextRegion.begin + currentRegion.end) * 0.5, currentRegion.end};
+				second = {nextRegion.begin, first.begin};
+			}
+		}
+
+		bool IsSecondDetected(const double pos) {
+			if (method == Simple)
+				return IsInside(pos, second) && !IsInside(pos, first);
+
+			if (phase == WaitingForSecond && IsInside(pos, second) && !IsInside(pos, first))
+				return true;
+
+			if (phase == WaitingForFirst && IsInside(pos, first) && !IsInside(pos, second))
+				phase = WaitingForSecond;
+			
+			return false;
+		}
+	};
+
+    ReaperInterface& reaper;
+	RegionSource&    source;
+
+	RegionData curRegion  = InvalidRegionData;
+	RegionData nextRegion = InvalidRegionData;
+
+	bool nextRegionScheduled = false;
+
+	mutable RegionDetector nextRegionDetector;
+
+	RegionData GetRegionData(const int rgn) const {
+		return -1 == rgn ? InvalidRegionData : RegionData{rgn, reaper.GetRegionBounds(rgn)};
+	}
+
+	RegionData FetchNextRegion() const {
+		return GetRegionData(source.GetNextRegion());
+	}
+
+	bool NextRegionDetected(const double pos) const {
+		return nextRegionDetector.IsSecondDetected(pos);
+	}
+
+	void Start() {
+		curRegion = FetchNextRegion();
+		if (!curRegion.Valid())	// Nothing to play
+			return;
+
+		nextRegion = FetchNextRegion();
+		nextRegionDetector.SetRegions(curRegion.bounds, nextRegion.bounds);
+
+		reaper.SeekPlay(curRegion.bounds.begin);
+	}
+
+public:
+	RegionSwitcher(RegionSource& source, ReaperInterface& reaper) :
+        source{source},
+        reaper{reaper}
+    {
+        Start();
+	}
+
+	bool Run(const double pos) {
+		if (!curRegion.Valid())
+			return false;
+		
+		if (reaper.IsPlaybackPaused()) {
+			nextRegionScheduled = false;
+			return false;
+		}
+
+		if (nextRegion.Valid() && NextRegionDetected(pos)) {
+			curRegion  = nextRegion;
+			nextRegion = FetchNextRegion();
+			nextRegionScheduled = false;
+			if (nextRegion.Valid()) {
+				nextRegionDetector.SetRegions(curRegion.bounds, nextRegion.bounds);
+			}
+            return true;
+		} else if (!IsInside(pos, curRegion.bounds)) {
+			// unsync
+		} else {
+			// in sync
+			if (nextRegion.Valid() &&
+				!nextRegionScheduled &&
+				IsInside(pos, {curRegion.bounds.end-JustInTimeNextRegionSchedulingWindow, curRegion.bounds.end}))
+			{
+				reaper.ScheduleRegion(nextRegion.idx);
+				nextRegionScheduled = true;
+			}
+		}
+
+        return false;
+	}
+
+    int GetCurrRegion () const {
+        return curRegion.idx;
+    }
+    int GetNextRegion () const {
+        return nextRegion.idx;
+    }
+};
+
+
+class PlaylistExecutor {
+    PlayStateListener& playStateListener;
+    ReaperInterface    reaper{};
+    RegionSource       regionSource;
+    RegionSwitcher     regionSwitcher;
+
+    void OnStateChange()
+    {
+        playStateListener.OnStateChange(regionSwitcher.GetCurrRegion(),
+                                        regionSource.GetCurrRegionLoop(),
+                                        regionSwitcher.GetNextRegion());
+    }
+
+public:
+    PlaylistExecutor(const int _playlistId, const int _startItemId, PlayStateListener& _playStateListener) :
+        playStateListener{_playStateListener},
+        regionSource{_playlistId, _startItemId},
+        regionSwitcher{regionSource, reaper}
+    {
+        OnStateChange();
+    }
+
+    void Run()
+    {
+        const bool wasSwitch = regionSwitcher.Run(reaper.GetPlayPosition());
+        if (wasSwitch) {
+            OnStateChange();
+        }
+    }
+};
+
+
+TRM::Optional<PlaylistExecutor> g_playlistExecutor;
+
+/////////////////
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -461,67 +763,62 @@ void RegionPlaylistView::OnEndDrag()
 // Info strings for monitoring windows + OSC feedback
 ///////////////////////////////////////////////////////////////////////////////
 
-void GetMonitoringInfo(WDL_FastString* _curNum, WDL_FastString* _cur, 
-					   WDL_FastString* _nextNum, WDL_FastString* _next)
+void GetMonitoringInfo(WDL_FastString& _curNum, WDL_FastString& _cur, 
+					   WDL_FastString& _nextNum, WDL_FastString& _next)
 {
-	if (g_playPlaylist>=0 && _curNum && _cur && _nextNum && _next)
+	// current playlist item
+	if (g_unsync)
 	{
-		if (RegionPlaylist* curpl = GetPlaylist(g_playPlaylist))
-		{
-			// current playlist item
-			if (g_unsync)
-			{
-				_curNum->Set("!");
-				_cur->Set(__LOCALIZE("<SYNC LOSS>)","sws_DLG_165"));
-			}
-			else if (RgnPlaylistItem* curItem = curpl->Get(g_playCur))
-			{
-				char buf[64]="";
-				EnumMarkerRegionDescById(NULL, curItem->m_rgnId, buf, sizeof(buf), SNM_REGION_MASK, false, true, false);
-				_curNum->SetFormatted(16, "%d", GetMarkerRegionNumFromId(curItem->m_rgnId));
-				_cur->Set(buf);
-			}
-			// current item not foud (e.g. playlist switch, g_playCur = -1) 
-			// => best effort: find region by play pos
-			else
-			{
-				int id, idx = FindMarkerRegion(NULL, GetPlayPositionEx(NULL), SNM_REGION_MASK, &id);
-				if (id > 0)
-				{
-					char buf[64]="";
-					EnumMarkerRegionDesc(NULL, idx, buf, sizeof(buf), SNM_REGION_MASK, false, true, false);
-					_curNum->SetFormatted(16, "%d", GetMarkerRegionNumFromId(id));
-					_cur->Set(buf);
-				}
-			}
+		_curNum.Set("!");
+		_cur.Set(__LOCALIZE("<SYNC LOSS>)","sws_DLG_165"));
+	}
+	else if (g_currRegionNum != -1)
+	{
 
-			// *** next playlist item ***
-			if (g_playNext<0)
-			{
-				_nextNum->Set("-");
-				_next->Set(__LOCALIZE("<END>","sws_DLG_165"));
-			}
-			else if (!g_unsync && g_rgnLoop && g_playCur>=0 && g_playCur==g_playNext)
-			{
-				if (g_rgnLoop>0)
-				{
-					_nextNum->Set(_curNum);
-					_next->SetFormatted(32, __LOCALIZE_VERFMT("<LOOP: %d>","sws_DLG_165"), g_rgnLoop);
-				}
-				else if (g_rgnLoop<0)
-				{
-					_nextNum->Set(_curNum);
-					_next->Set(UTF8_INFINITY);
-				}
-			}
-			else if (RgnPlaylistItem* nextItem = curpl->Get(g_playNext))
-			{
-				char buf[64]="";
-				EnumMarkerRegionDescById(NULL, nextItem->m_rgnId, buf, sizeof(buf), SNM_REGION_MASK, false, true, false);
-				_nextNum->SetFormatted(16, "%d", GetMarkerRegionNumFromId(nextItem->m_rgnId));
-				_next->Set(buf);
-			}
+		char buf[64]="";
+		EnumMarkerRegionDescById(nullptr, MakeMarkerRegionId(g_currRegionNum, true), buf, sizeof(buf), SNM_REGION_MASK, false, true, false);
+		_curNum.SetFormatted(16, "%d", g_currRegionNum);
+		_cur.Set(buf);
+	}
+	// current item not foud (e.g. playlist switch, g_playCur = -1) 
+	// => best effort: find region by play pos
+	else
+	{
+		int id, idx = FindMarkerRegion(NULL, GetPlayPositionEx(NULL), SNM_REGION_MASK, &id);
+		if (id > 0)
+		{
+			char buf[64]="";
+			EnumMarkerRegionDesc(NULL, idx, buf, sizeof(buf), SNM_REGION_MASK, false, true, false);
+			_curNum.SetFormatted(16, "%d", GetMarkerRegionNumFromId(id));
+			_cur.Set(buf);
 		}
+	}
+
+	// *** next playlist item ***
+	if (g_nextRegionNum<0)
+	{
+		_nextNum.Set("-");
+		_next.Set(__LOCALIZE("<END>","sws_DLG_165"));
+	}
+	else if (!g_unsync && g_currRegionLoop && g_currRegionNum>=0 && g_currRegionNum==g_nextRegionNum)
+	{
+		if (g_currRegionLoop>0)
+		{
+			_nextNum.Set(&_curNum);
+			_next.SetFormatted(32, __LOCALIZE_VERFMT("<LOOP: %d>","sws_DLG_165"), g_currRegionLoop);
+		}
+		else if (g_currRegionLoop<0)
+		{
+			_nextNum.Set(&_curNum);
+			_next.Set(UTF8_INFINITY);
+		}
+	}
+	else if (g_nextRegionNum != -1)
+	{
+		char buf[64]="";
+		EnumMarkerRegionDescById(nullptr, MakeMarkerRegionId(g_nextRegionNum, true), buf, sizeof(buf), SNM_REGION_MASK, false, true, false);
+		_nextNum.SetFormatted(16, "%d", g_nextRegionNum);
+		_next.Set(buf);
 	}
 }
 
@@ -557,9 +854,6 @@ void RegionPlaylistWnd::OnInitDlg()
 
 	m_vwnd_painter.SetGSC(WDL_STYLE_GetSysColor);
 	m_parentVwnd.SetRealParent(m_hwnd);
-	
-	m_btnLock.SetID(BTNID_LOCK);
-	m_parentVwnd.AddChild(&m_btnLock);
 
 	m_btnPlay.SetID(BTNID_PLAY);
 	m_parentVwnd.AddChild(&m_btnPlay);
@@ -673,7 +967,7 @@ void RegionPlaylistWnd::UpdateMonitoring(WDL_FastString* _curNum, WDL_FastString
 	if (!_next) next = new WDL_FastString;
 	if (!_nextNum) nextNum = new WDL_FastString;
 	if (!_cur||!_curNum||!_next||!_nextNum)
-		GetMonitoringInfo(curNum, cur, nextNum, next);
+		GetMonitoringInfo(*curNum, *cur, *nextNum, *next);
 
 	m_mons.SetText(1, curNum->Get(), g_playPlaylist<0 ? 0 : g_unsync ? SNM_COL_RED_MONITOR : 0);
 	m_mons.SetText(2, cur->Get(), g_playPlaylist<0 ? 0 : g_unsync ? SNM_COL_RED_MONITOR : 0);
@@ -702,10 +996,6 @@ void RegionPlaylistWnd::OnCommand(WPARAM wParam, LPARAM lParam)
 {
 	switch(LOWORD(wParam))
 	{
-		case BTNID_LOCK:
-			if (!HIWORD(wParam))
-				ToggleLock();
-			break;
 		case CMBID_PLAYLIST:
 			if (HIWORD(wParam)==CBN_SELCHANGE)
 			{
@@ -961,80 +1251,76 @@ void RegionPlaylistWnd::DrawControls(LICE_IBitmap* _bm, const RECT* _r, int* _to
 	bool hasPlaylists = (g_pls.Get()->GetSize()>0);
 	RegionPlaylist* pl = GetPlaylist();
 
-	SNM_SkinButton(&m_btnLock, it ? &it->toolbar_lock[!g_monitorMode] : NULL, g_monitorMode ? __LOCALIZE("Edition mode","sws_DLG_165") : __LOCALIZE("Monitoring mode","sws_DLG_165"));
-	if (SNM_AutoVWndPosition(DT_LEFT, &m_btnLock, NULL, _r, &x0, _r->top, h))
+#ifndef _RGNPL_TRANSPORT_RIGHT
+	SNM_SkinButton(&m_btnPlay, it ? &it->gen_play[g_playPlaylist>=0?1:0] : NULL, __LOCALIZE("Play","sws_DLG_165"));
+	if (SNM_AutoVWndPosition(DT_LEFT, &m_btnPlay, NULL, _r, &x0, _r->top, h, 0))
 	{
-#ifndef _RGNPL_TRANSPORT_RIGHT
-		SNM_SkinButton(&m_btnPlay, it ? &it->gen_play[g_playPlaylist>=0?1:0] : NULL, __LOCALIZE("Play","sws_DLG_165"));
-		if (SNM_AutoVWndPosition(DT_LEFT, &m_btnPlay, NULL, _r, &x0, _r->top, h, 0))
+		SNM_SkinButton(&m_btnStop, it ? &(it->gen_stop) : NULL, __LOCALIZE("Stop","sws_DLG_165"));
+		if (SNM_AutoVWndPosition(DT_LEFT, &m_btnStop, NULL, _r, &x0, _r->top, h, 0))
 		{
-			SNM_SkinButton(&m_btnStop, it ? &(it->gen_stop) : NULL, __LOCALIZE("Stop","sws_DLG_165"));
-			if (SNM_AutoVWndPosition(DT_LEFT, &m_btnStop, NULL, _r, &x0, _r->top, h, 0))
-			{
-				SNM_SkinButton(&m_btnRepeat, it ? &it->gen_repeat[g_repeatPlaylist?1:0] : NULL, __LOCALIZE("Repeat","sws_DLG_165"));
-				if (SNM_AutoVWndPosition(DT_LEFT, &m_btnRepeat, NULL, _r, &x0, _r->top, h))
+			SNM_SkinButton(&m_btnRepeat, it ? &it->gen_repeat[g_repeatPlaylist?1:0] : NULL, __LOCALIZE("Repeat","sws_DLG_165"));
+			if (SNM_AutoVWndPosition(DT_LEFT, &m_btnRepeat, NULL, _r, &x0, _r->top, h))
 #endif
+			{
+				// *** monitoring ***
+				if (g_monitorMode)
 				{
-					// *** monitoring ***
-					if (g_monitorMode)
-					{
-						RECT r = *_r;
+					RECT r = *_r;
 
-						r.top += int(SNM_GUI_TOP_H/2+0.5);
-						r.bottom -= int(SNM_GUI_TOP_H/2);
-						m_mons.SetPosition(&r);
-						m_mons.SetVisible(true);
-						
-						r = *_r;
+					r.top += int(SNM_GUI_TOP_H/2+0.5);
+					r.bottom -= int(SNM_GUI_TOP_H/2);
+					m_mons.SetPosition(&r);
+					m_mons.SetVisible(true);
+					
+					r = *_r;
 
-						// playlist name
-						r.left = x0;
-						r.bottom = h;
+					// playlist name
+					r.left = x0;
+					r.bottom = h;
 #ifndef _RGNPL_TRANSPORT_RIGHT
-						LICE_IBitmap* logo = SNM_GetThemeLogo();
+					LICE_IBitmap* logo = SNM_GetThemeLogo();
 //						r.right -= logo ? logo->getWidth()+5 : 5; // 5: margin
 #else
-						r.right -= (75+SNM_GUI_X_MARGIN); //JFB lazy here.. should be play+stop+repeat btn widths
+					r.right -= (75+SNM_GUI_X_MARGIN); //JFB lazy here.. should be play+stop+repeat btn widths
 #endif
-						m_monPl.SetPosition(&r);
-						m_monPl.SetVisible(true);
-					}
+					m_monPl.SetPosition(&r);
+					m_monPl.SetVisible(true);
+				}
 
-					// *** edition ***
-					else
+				// *** edition ***
+				else
+				{
+					m_txtPlaylist.SetText(hasPlaylists ? __LOCALIZE("Playlist #","sws_DLG_165") : __LOCALIZE("Playlist: None","sws_DLG_165"));
+					if (SNM_AutoVWndPosition(DT_LEFT, &m_txtPlaylist, NULL, _r, &x0, _r->top, h, hasPlaylists?4:SNM_DEF_VWND_X_STEP))
 					{
-						m_txtPlaylist.SetText(hasPlaylists ? __LOCALIZE("Playlist #","sws_DLG_165") : __LOCALIZE("Playlist: None","sws_DLG_165"));
-						if (SNM_AutoVWndPosition(DT_LEFT, &m_txtPlaylist, NULL, _r, &x0, _r->top, h, hasPlaylists?4:SNM_DEF_VWND_X_STEP))
+						if (!hasPlaylists || SNM_AutoVWndPosition(DT_LEFT, &m_cbPlaylist, &m_txtPlaylist, _r, &x0, _r->top, h, 4))
 						{
-							if (!hasPlaylists || SNM_AutoVWndPosition(DT_LEFT, &m_cbPlaylist, &m_txtPlaylist, _r, &x0, _r->top, h, 4))
+							m_btnDel.SetEnabled(hasPlaylists);
+							if (SNM_AutoVWndPosition(DT_LEFT, &m_btnsAddDel, NULL, _r, &x0, _r->top, h))
 							{
-								m_btnDel.SetEnabled(hasPlaylists);
-								if (SNM_AutoVWndPosition(DT_LEFT, &m_btnsAddDel, NULL, _r, &x0, _r->top, h))
+								if (abs(hasPlaylists && pl ? pl->GetLength() : 0.0) > 0.0) // <0.0 means infinite
 								{
-									if (abs(hasPlaylists && pl ? pl->GetLength() : 0.0) > 0.0) // <0.0 means infinite
+									SNM_SkinToolbarButton(&m_btnCrop, __LOCALIZE("Edit project","sws_DLG_165"));
+									if (SNM_AutoVWndPosition(DT_LEFT, &m_btnCrop, NULL, _r, &x0, _r->top, h))
 									{
-										SNM_SkinToolbarButton(&m_btnCrop, __LOCALIZE("Edit project","sws_DLG_165"));
-										if (SNM_AutoVWndPosition(DT_LEFT, &m_btnCrop, NULL, _r, &x0, _r->top, h))
-										{
 #ifndef _RGNPL_TRANSPORT_RIGHT
-											SNM_AddLogo(_bm, _r, x0, h);
-#endif
-										}
-									}
-#ifndef _RGNPL_TRANSPORT_RIGHT
-									else
 										SNM_AddLogo(_bm, _r, x0, h);
 #endif
+									}
 								}
+#ifndef _RGNPL_TRANSPORT_RIGHT
+								else
+									SNM_AddLogo(_bm, _r, x0, h);
+#endif
 							}
 						}
 					}
 				}
-#ifndef _RGNPL_TRANSPORT_RIGHT
 			}
+#ifndef _RGNPL_TRANSPORT_RIGHT
 		}
-#endif
 	}
+#endif
 
 #ifdef _RGNPL_TRANSPORT_RIGHT
 	x0 = _r->right-SNM_GUI_X_MARGIN;
@@ -1181,9 +1467,6 @@ bool RegionPlaylistWnd::GetToolTipString(int _xpos, int _ypos, char* _bufOut, in
 	{
 		switch (v->GetID())
 		{
-			case BTNID_LOCK:
-				lstrcpyn(_bufOut, __LOCALIZE("Toggle monitoring/edition mode","sws_DLG_165"), _bufOutSz);
-				return true;
 			case BTNID_PLAY:
 				if (g_playPlaylist>=0) snprintf(_bufOut, _bufOutSz, __LOCALIZE_VERFMT("Playing playlist #%d","sws_DLG_165"), g_playPlaylist+1);
 				else lstrcpyn(_bufOut, __LOCALIZE("Play","sws_DLG_165"), _bufOutSz);
@@ -1221,11 +1504,11 @@ bool RegionPlaylistWnd::GetToolTipString(int _xpos, int _ypos, char* _bufOut, in
 	return false;
 }
 
-void RegionPlaylistWnd::ToggleLock()
+void SetLock(bool lock)
 {
-	g_monitorMode = !g_monitorMode;
-	RefreshToolbar(SWSGetCommandID(ToggleRegionPlaylistLock));
-	Update();
+	g_monitorMode = lock;
+	if (RegionPlaylistWnd* w = g_rgnplWndMgr.Get())
+		w->Update();
 }
 
 
@@ -1369,11 +1652,15 @@ bool SeekItem(int _plId, int _nextItemId, int _curItemId)
 
 void UpdateDisplayWindows()
 {
+	RegionPlaylistWnd* w = g_rgnplWndMgr.Get();
+	if (w == nullptr && g_osc == nullptr)
+		return;
+
 	// one call to GetMonitoringInfo() for both the wnd & osc
 	WDL_FastString cur, curNum, next, nextNum;
-	GetMonitoringInfo(&curNum, &cur, &nextNum, &next);
+	GetMonitoringInfo(curNum, cur, nextNum, next);
 
-	if (RegionPlaylistWnd* w = g_rgnplWndMgr.Get())
+	if (w)
 		w->Update(1, &curNum, &cur, &nextNum, &next); // 1: fast update flag
 
 	if (g_osc)
@@ -1403,123 +1690,8 @@ void UpdateDisplayWindows()
 // made as idle as possible, polled via SNM_CSurfRun()
 void PlaylistRun()
 {
-	if (g_playPlaylist>=0)
-	{
-#if defined(_SNM_RGNPL_DEBUG1) || defined(_SNM_RGNPL_DEBUG2)
-		char dbg[256] = "";
-#endif
-		bool updated = false;
-		double pos = GetPlayPosition2Ex(NULL);
-
-		// NF: potentially fix #886
-		// it seems that if '+0.01' isn't added to 'pos' below, adjacent regions are no more occasionally skipped
-		// https://forum.cockos.com/showpost.php?p=1935561&postcount=6 and my own tests so far seem to confirm also
-		// but I'm unsure what potential side effects this might have
-		if ((pos/*+0.01*/) >= g_nextRgnPos && pos <= g_nextRgnEnd)	//JFB!! +0.01 because 'pos' can be a bit ahead of time
-																// +1 sample block would be better, but no API..
-																// note: sync loss detection will deal with this in the worst case
-		{
-			// a bunch of calls end here when looping!!
-
-			if (!g_plLoop || g_unsync || pos<g_lastRunPos)
-			{
-				g_plLoop = false;
-
-				bool first = false;
-				if (g_playCur != g_playNext 
-/*JFB those vars are only altered here
-					|| g_curRgnPos != g_nextRgnPos || g_curRgnEnd != g_nextRgnEnd
-*/
-					)
-				{
-#ifdef _SNM_RGNPL_DEBUG1
-					 OutputDebugString("\n");
-					snprintf(dbg, sizeof(dbg), "NEXT DETECTED - pos = %f\n", pos); OutputDebugString(dbg);
-					snprintf(dbg, sizeof(dbg), "                g_curRgnPos = %f, g_curRgnEnd = %f\n", g_curRgnPos, g_curRgnEnd); OutputDebugString(dbg);
-					snprintf(dbg, sizeof(dbg), "                g_nextRgnPos = %f, g_nextRgnEnd = %f\n", g_nextRgnPos, g_nextRgnEnd); OutputDebugString(dbg);
-					snprintf(dbg, sizeof(dbg), "                g_playCur = %d, g_playNext = %d\n", g_playCur, g_playNext); OutputDebugString(dbg);
-					snprintf(dbg, sizeof(dbg), "                g_unsync = %d, g_lastRunPos = %f\n", g_unsync, g_lastRunPos); OutputDebugString(dbg);
-#endif
-					first = updated = true;
-					g_playCur = g_playNext;
-					g_curRgnPos = g_nextRgnPos;
-					g_curRgnEnd = g_nextRgnEnd;
-				}
-
-				// region loop?
-				if (g_rgnLoop && (first || g_unsync || pos<g_lastRunPos))
-				{
-					updated = true;
-					if (g_rgnLoop>0)
-						g_rgnLoop--;
-					if (g_rgnLoop)
-						SeekPlay(g_nextRgnPos); // then exit
-				}
-
-				if (!g_rgnLoop) // if, not else if!
-				{
-					int nextId = GetNextValidItem(g_playPlaylist, g_playCur, false, g_repeatPlaylist, g_shufflePlaylist);
-
-					// loop corner cases
-					// ex: 1 item in the playlist + repeat on, or repeat on + last region == first region,
-					//     or playlist = region3, then unknown region (e.g. deleted) and region3 again, or etc..
-					if (nextId>=0)
-						if (RegionPlaylist* pl = GetPlaylist(g_playPlaylist))
-							if (RgnPlaylistItem* next = pl->Get(nextId)) 
-								if (RgnPlaylistItem* cur = pl->Get(g_playCur)) 
-									g_plLoop = (cur->m_rgnId==next->m_rgnId); // valid regions at this point
-
-#ifdef _SNM_RGNPL_DEBUG1
-					snprintf(dbg, sizeof(dbg), "SEEK - Current = %d, Next = %d\n", g_playCur, nextId); OutputDebugString(dbg);
-#endif
-					if (!SeekItem(g_playPlaylist, nextId, g_playCur))
-						SeekItem(g_playPlaylist, -1, g_playCur); // end of playlist..
-					updated = true;
-				}
-			}
-			g_unsync = false;
-		}
-		else if (g_curRgnPos<g_curRgnEnd) // relevant vars?
-		{
-			// seek play requested, waiting for region switch..
-			if ((pos+0.01) >= g_curRgnPos && pos <= g_curRgnEnd) //JFB!! +0.01 because 'pos' can be a bit ahead of time
-																 // +1 sample block would be better, but no API..
-			{
-				// a bunch of calls end here!
-				g_unsync = false;
-			}
-			// playlist no more in sync?
-			else if (!g_unsync)
-			{
-#ifdef _SNM_RGNPL_DEBUG2
-				snprintf(dbg, sizeof(dbg), ">>> SYNC LOSS - pos = %f\n", pos); OutputDebugString(dbg);
-				snprintf(dbg, sizeof(dbg), "                g_curRgnPos = %f, g_curRgnEnd = %f\n", g_curRgnPos, g_curRgnEnd); OutputDebugString(dbg);
-				snprintf(dbg, sizeof(dbg), "                g_nextRgnPos = %f, g_nextRgnEnd = %f\n", g_nextRgnPos, g_nextRgnEnd); OutputDebugString(dbg);
-#endif
-				updated = g_unsync = true;
-				int spareItemId = -1;
-				if (RegionPlaylist* pl = g_pls.Get()->Get(g_playPlaylist))
-					spareItemId = pl->IsInPlaylist(pos, g_repeatPlaylist, g_playCur>=0?g_playCur:0);
-				if (spareItemId<0 || !SeekItem(g_playPlaylist, spareItemId, -1))
-				{
-#ifdef _SNM_RGNPL_DEBUG2
-					snprintf(dbg, sizeof(dbg), ">>> SYNC LOSS, SEEK expected region pos = %f\n", g_nextRgnPos); OutputDebugString(dbg);
-#endif
-					SeekPlay(g_nextRgnPos);	// try to resync the expected region, best effort
-				}
-#ifdef _SNM_RGNPL_DEBUG2
-				else {
-					snprintf(dbg, sizeof(dbg), ">>> SYNC LOSS, SEEK - Current = %d, Next = %d\n", -1, spareItemId); OutputDebugString(dbg);
-				}
-#endif
-			}
-		}
-
-		g_lastRunPos = pos;
-		if (updated && (g_osc || g_rgnplWndMgr.Get()))
-		{
-			UpdateDisplayWindows();
-		}
+	if (!g_playlistExecutor.empty()) {
+		g_playlistExecutor->Run();
 	}
 }
 
@@ -1557,17 +1729,6 @@ void PlaylistPlay(int _plId, int _itemId)
 			}
 		}
 
-		num = pl->GetNestedMarkerRegion();
-		if (num>0)
-		{
-			char msg[256] = "";
-			snprintf(msg, sizeof(msg), __LOCALIZE_VERFMT("The playlist #%d might not work as expected!\nIt contains nested markers/regions (inside region %d at least).","sws_DLG_165"), _plId+1, num);
-			if (IDCANCEL == MessageBox(g_rgnplWndMgr.GetMsgHWND(), msg, __LOCALIZE("S&M - Warning","sws_DLG_165"), MB_OKCANCEL)) {
-				PlaylistStop();
-				return;
-			}
-		}
-
 		// handle empty project corner case
 		if (pl->IsValidIem(_itemId))
 		{
@@ -1585,25 +1746,9 @@ void PlaylistPlay(int _plId, int _itemId)
 				GetSetRepeat(0);
 			}
 
-			g_plLoop = false;
-			g_unsync = false;
-			g_lastRunPos = SNM_GetProjectLength()+1.0;
-			if (SeekItem(_plId, _itemId, g_playPlaylist==_plId ? g_playCur : -1))
-			{
-				g_playPlaylist = _plId; // enables PlaylistRun()
-				if (RegionPlaylistWnd* w = g_rgnplWndMgr.Get())
-					w->Update(); // for the play button, next/previous region actions, etc....
-			}
-			else
-				PlaylistStopped(); // reset vars & native prefs
+			g_playlistExecutor.emplace(_plId, _itemId, g_listener);
+			SetLock(true);
 		}
-	}
-
-	if (g_playPlaylist<0)
-	{
-		char msg[128] = "";
-		snprintf(msg, sizeof(msg), __LOCALIZE_VERFMT("Playlist #%d: nothing to play!\n(empty playlist, empty project, removed regions, etc..)","sws_DLG_165"), _plId+1);
-		MessageBox(g_rgnplWndMgr.GetMsgHWND(), msg, __LOCALIZE("S&M - Error","sws_DLG_165"),MB_OK);
 	}
 }
 
@@ -1667,7 +1812,7 @@ void PlaylistSeekPrevNextCurBased(COMMAND_T* _ct)
 
 void PlaylistStop()
 {
-	if (g_playPlaylist>=0 || (GetPlayStateEx(NULL)&1) == 1)
+	if (!g_playlistExecutor.empty() || (GetPlayStateEx(NULL)&1) == 1)
 	{
 		OnStopButton();
 /* commented: already done via SNM_CSurfSetPlayState() callback
@@ -1676,12 +1821,10 @@ void PlaylistStop()
 	}
 }
 
-void PlaylistStopped(bool _pause)
+void PlaylistStopped()
 {
-	if (g_playPlaylist>=0 && !_pause)
+	if (!g_playlistExecutor.empty())
 	{
-		g_playPlaylist = -1;
-
 		// restore options
 		if (g_oldSeekPref >= 0)
 			if (ConfigVar<int> opt = "smoothseek") {
@@ -1698,9 +1841,10 @@ void PlaylistStopped(bool _pause)
 			g_oldRepeatState = -1;
 		}
 
-		if (RegionPlaylistWnd* w = g_rgnplWndMgr.Get())
-			w->Update();
+        g_playlistExecutor.clear();
 	}
+
+	SetLock(false);
 }
 
 void PlaylistUnpaused() {
@@ -2158,7 +2302,6 @@ int RegionPlaylistInit()
 {
 	// load prefs
 	char buf[64]="";
-	g_monitorMode = GetPrivateProfileInt("RegionPlaylist", "MonitorMode", 0, g_SNM_IniFn.Get());
 	g_repeatPlaylist = GetPrivateProfileInt("RegionPlaylist", "Repeat", 0, g_SNM_IniFn.Get());
 	g_seekImmediate = GetPrivateProfileInt("RegionPlaylist", "SeekImmediate", 0, g_SNM_IniFn.Get());
 	g_shufflePlaylist = GetPrivateProfileInt("RegionPlaylist", "ShufflePlaylist", 0, g_SNM_IniFn.Get());
@@ -2184,7 +2327,6 @@ void RegionPlaylistExit()
 
 	// save prefs
 	const std::pair<const char *, int> intOptions[] = {
-		{ "MonitorMode",     g_monitorMode     },
 		{ "Repeat",          g_repeatPlaylist  },
 		{ "SeekImmediate",   g_seekImmediate   },
 		{ "ShufflePlaylist", g_shufflePlaylist },
@@ -2222,8 +2364,6 @@ int IsRegionPlaylistDisplayed(COMMAND_T*){
 }
 
 void ToggleRegionPlaylistLock(COMMAND_T*) {
-	if (RegionPlaylistWnd* w = g_rgnplWndMgr.Get())
-		w->ToggleLock();
 }
 
 int IsRegionPlaylistMonitoring(COMMAND_T*) {
