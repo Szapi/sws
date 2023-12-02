@@ -123,11 +123,6 @@ double g_lastRunPos = -1.0;
 double g_nextRgnPos, g_nextRgnEnd;
 double g_curRgnPos = 0.0, g_curRgnEnd = -1.0; // to detect unsync, end<pos means non relevant
 
-int g_oldSeekPref = -1;
-int g_oldStopprojlenPref = -1;
-int g_oldRepeatState = -1;
-int g_oldStopEndOfLoop = -1;
-
 
 // _plId: -1 for the displayed/edited playlist
 RegionPlaylist* GetPlaylist(int _plId = -1) {
@@ -413,7 +408,36 @@ public:
 };
 
 
+class OverrideAndRestoreReaperState {
+	ConfigVarOverride<int> overrideSmoothSeek    = {ConfigVar<int>{"smoothseek"},    3};
+	ConfigVarOverride<int> overrideStopProjLen   = {ConfigVar<int>{"stopprojlen"},   0};
+	ConfigVarOverride<int> overrideStopEndOfLoop = {ConfigVar<int>{"stopendofloop"}, 0};
+
+	int 		 oldRepeatState   = -1;
+	TimeInterval oldTimeSelection = InvalidInterval;
+
+public:
+	OverrideAndRestoreReaperState() {
+		if (GetSetRepeat(-1) == 1) {
+			oldRepeatState = 1;
+			GetSetRepeat(0);
+		}
+
+		GetSet_LoopTimeRange2(nullptr, false, false, &oldTimeSelection.begin, &oldTimeSelection.end, false);
+	}
+
+	~OverrideAndRestoreReaperState() {
+		GetSet_LoopTimeRange2(nullptr, true, false, &oldTimeSelection.begin, &oldTimeSelection.end, false);
+
+		if (oldRepeatState >=0)
+			GetSetRepeat(oldRepeatState);
+	}
+};
+
+
 class PlaylistExecutor {
+	OverrideAndRestoreReaperState overrideAndRestoreReaperState;
+
     PlayStateListener& playStateListener;
     ReaperInterface    reaper{};
     RegionSource       regionSource;
@@ -451,10 +475,6 @@ bool IsMonitorMode()
 {
     return g_playlistExecutor.has_value();
 }
-
-/////////////////
-
-TimeInterval g_oldTimeSelection = InvalidInterval;
 
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -1631,11 +1651,6 @@ bool SeekItem(int _plId, int _nextItemId, int _curItemId)
 		// trick to stop the playlist in sync: smooth seek to the end of the project (!)
 		if (_nextItemId<0)
 		{
-			// temp override of the "stop play at project end" option
-			if (ConfigVar<int> opt = "stopprojlen") {
-				g_oldStopprojlenPref = *opt;
-				*opt = 1;
-			}
 			g_playNext = -1;
 			g_rgnLoop = 0;
 			g_nextRgnPos = SNM_GetProjectLength()+1.0;
@@ -1750,24 +1765,6 @@ void PlaylistPlay(int _plId, int _itemId)
 			if (g_seekImmediate)
 				PlaylistStop();
 
-			// save time selection
-			GetSet_LoopTimeRange2(nullptr, false, false, &g_oldTimeSelection.begin, &g_oldTimeSelection.end, false);
-			// temp override of the "smooth seek" option
-			if (ConfigVar<int> opt = "smoothseek") {
-				g_oldSeekPref = *opt;
-				*opt = 3;
-			}
-			// temp override of the repeat/loop state option
-			if (GetSetRepeat(-1) == 1) {
-				g_oldRepeatState = 1;
-				GetSetRepeat(0);
-			}
-			// temp override of the "Stop playback at end of loop..." option
-			if (ConfigVar<int> opt = "stopendofloop") {
-				g_oldStopEndOfLoop = *opt;
-				*opt = 0;
-			}
-
 			g_playlistExecutor.emplace(_plId, _itemId, g_listener);    
             if (RegionPlaylistWnd* w = g_rgnplWndMgr.Get())
                 w->Update();
@@ -1847,33 +1844,7 @@ void PlaylistStop()
 void PlaylistStopped()
 {
 	if (g_playlistExecutor.has_value())
-	{
-		// restore time selection
-		GetSet_LoopTimeRange2(nullptr, true, false, &g_oldTimeSelection.begin, &g_oldTimeSelection.end, false);
-		g_oldTimeSelection = InvalidInterval;
-		// restore options
-		if (g_oldSeekPref >= 0)
-			if (ConfigVar<int> opt = "smoothseek") {
-				*opt = g_oldSeekPref;
-				g_oldSeekPref = -1;
-			}
-		if (g_oldStopprojlenPref >= 0)
-			if (ConfigVar<int> opt = "stopprojlen") {
-				*opt = g_oldStopprojlenPref;
-				g_oldStopprojlenPref = -1;
-			}
-		if (g_oldRepeatState >=0) {
-			GetSetRepeat(g_oldRepeatState);
-			g_oldRepeatState = -1;
-		}
-		if (g_oldStopEndOfLoop >= 0)
-			if (ConfigVar<int> opt = "stopendofloop") {
-				*opt = g_oldStopEndOfLoop;
-				g_oldStopEndOfLoop = -1;
-			}
-
         g_playlistExecutor.clear();
-	}
 
 	if (RegionPlaylistWnd* w = g_rgnplWndMgr.Get())
 		w->Update();
